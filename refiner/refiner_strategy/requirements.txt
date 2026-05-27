@@ -1,0 +1,10 @@
+pandas>=2.0
+numpy>=1.26
+pyarrow>=14.0
+yfinance>=0.2.36
+chronos-forecasting>=1.4
+torch>=2.1
+peft>=0.7
+transformers>=4.36
+matplotlib>=3.8
+scikit-learn>=1.3
