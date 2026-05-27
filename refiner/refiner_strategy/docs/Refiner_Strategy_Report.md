@@ -342,132 +342,158 @@ Each fold uses a deterministic seed: `fold_seed = 42 + fold_idx`. This ensures r
 
 # Part 5: The 6 Sizing Schemes
 
-*Goal: Test whether adding AI and/or volatility targeting improves on the baseline rule.*
-
-Each scheme answers the same question differently: **"Given a Chronos prediction and a DET signal, how much capital should I allocate to this ticker today?"**
-
-All schemes share the same signature: `sizer(pred, det_sig, weights, ticker, notional, realized_vol) → float`
-
-The progression tells a story of iterative improvement:
+*The core problem all sizers solve: given a Chronos-2 forecast and a crack-spread signal, how much capital should we commit to a refiner stock today?*
 
 ---
 
-## 5.1 — OLD: Probability-Only Sizer
+## The Central Finding
 
-**Source:** The original (pre-improvement) strategy.
+Before examining individual schemes, the most important result must be stated upfront:
 
-```
-if 0.40 < p_up < 0.60:  → FLAT (too uncertain)
-else:
-    conviction = min(1.0, |p_up − 0.5| × 5.0)
-    size = ±conviction × ticker_capital
-```
+**All six schemes produce directional hit rates between 50.9% and 53.0% — essentially indistinguishable. The Sharpe ratio improves 7× from 0.07 (OLD) to 0.51 (ENS_VETO). Every basis point of that improvement comes from sizing discipline, not from predicting direction more accurately.**
 
-**What it does:** Uses only `p_up` (probability of up). Applies a deadband: if `p_up` is between 40–60% (near a coin flip), it does nothing. Outside that range, it sizes linearly with conviction.
-
-**Weakness:** Ignores the *magnitude* of the expected return. A `p_up` of 0.65 with a tiny expected return gets the same size as one with a large expected return. It also ignores realized volatility — it allocates the same size in a calm market and a volatile one.
+The progression OLD → ENS_AVG is not a story of better AI. It is a story of better risk management. Hit rates barely move. Sharpe ratios do not. This is the central lesson of the backtest.
 
 ---
 
-## 5.2 — NEW: Vol-Targeted Sizer
+## 5.1 — OLD: Probability-Only Sizer (Naïve baseline)
 
 ```
-forecast_vol = (q90 − q10) / 2.5631     ← Chronos uncertainty spread
-if forecast_vol < 0.005:  → FLAT         ← Gate 1: signal too weak
-if sign(q50) ≠ sign(p_up − 0.5):  → FLAT ← Gate 2: consensus required
-
-edge = q50 / forecast_vol               ← signal-to-noise ratio
-size = clip(edge / 0.01, −1, 1) × ticker_capital
+if 0.40 < p_up < 0.60:  return 0.0   # deadband
+conviction = |p_up - 0.5| × 5
+size = direction × conviction × capital
 ```
 
-**What it does:** Sizes proportional to the **signal-to-noise ratio** (`q50 / forecast_vol`). A high expected return with low uncertainty → large position. A small expected return with high uncertainty → small position.
+**Economic logic:** Pure binary bet. If the model says >60% chance of going up, go long; <40%, go short. Conviction scales linearly with probability edge.
 
-**Gate 1 — volatility floor:** If the model's uncertainty spread (`q90−q10`) is tiny, the signal is too weak to trade. No position.
-
-**Gate 2 — consensus:** If the median forecast (`q50`) says up but `p_up < 0.5` says down, the model is internally contradictory. No position.
-
-**`Q90_Q10_TO_SIGMA = 2.5631`:** This is `2 × 1.2816`, where 1.2816 is the z-score of the 90th percentile of a standard normal. It converts the q90−q10 spread into an approximate 1-sigma forecast uncertainty.
+**Why it fails:**
+- Ignores how volatile the asset is. A 70% conviction bet in a 5%-daily-vol stock is far riskier than the same bet in a 0.5%-vol stock.
+- No risk budget → position sizes are arbitrary relative to the portfolio's risk tolerance.
+- Equivalent to Kelly betting with no variance adjustment, which leads to ruin over time.
 
 ---
 
-## 5.3 — NEW_CAP: Vol-Targeted + Realized Vol Cap
+## 5.2 — NEW: Vol-Targeted Sizer (Moskowitz-Ooi-Pedersen 2012)
 
 ```
-base = size_new(...)              ← inherit all of NEW's logic
-if realized_vol > VOL_CAP (0.02):
-    size = base × (0.02 / realized_vol)   ← scale down proportionally
+forecast_vol = (q90 - q10) / 2.56     # implied σ from quantile spread
+if q50 and p_up disagree in direction: return 0.0   # consensus gate
+edge  = q50 / forecast_vol             # Sharpe-like ratio
+size  = edge / TARGET_DAILY_VOL × capital
 ```
 
-**What it adds:** A realized volatility cap. If the stock's actual 20-day realized volatility exceeds 2%/day (annualizes to ~32%), the position is scaled down. During market stress, volatility can spike 3–4x. Without a cap, you might hold the same size during a crisis as during calm markets.
+**Economic logic:** Targets a constant daily portfolio volatility (1% per day, set in config). Inspired by time-series momentum literature.
+
+- `forecast_vol` = implied uncertainty of the Chronos prediction (wide quantile spread = uncertain forecast = smaller position)
+- `edge / forecast_vol` = a forward-looking Information Ratio — expected return per unit of forecast risk
+- Dividing by `TARGET_DAILY_VOL` translates that ratio into a position that contributes exactly 1% vol to the portfolio if the model is right
+
+**Why this is better:** It answers the question "how confident is the model?" not just "which direction?". A tight quantile spread (model is sure) → bigger bet. Wide spread (model is uncertain) → smaller bet. Rational risk allocation.
+
+**Consensus gate:** Rejects trades where the median forecast (q50) and probability (p_up) point in opposite directions — a self-contradiction in the model's output, discarding low-quality signals.
 
 ---
 
-## 5.4 — DET: Pure Deterministic Signal
+## 5.3 — NEW_CAP: Vol-Targeted + Realized-Vol Cap (Drawdown control)
 
 ```
-size = det_sig × ticker_capital × vol_cap_if_needed
+base = size_new(...)
+if realized_vol > VOL_CAP (2%/day):
+    size = base × (VOL_CAP / realized_vol)
 ```
 
-**What it does:** Ignores Chronos entirely. Just the crack-spread SMA crossover rule with a vol cap. This is the **pure rule-based baseline** — if the AI doesn't beat this, it's not adding value.
+**Economic logic:** Adds a realized volatility brake on top of the forecast-vol sizing.
+
+The NEW sizer uses predicted vol from Chronos quantiles. But markets can spike — a refiner stock might suddenly move 4%/day due to an oil shock. NEW_CAP de-levers automatically when the market itself is volatile, regardless of what Chronos thinks.
+
+This is the risk management layer: even if the model is confident (tight quantiles), if the stock is whipping around 3× its normal range, you cut size. Similar to how volatility-targeting funds reduce exposure after the VIX spikes.
 
 ---
 
-## 5.5 — ENS_VETO: Ensemble Veto
+## 5.4 — DET: Pure Deterministic Signal (Rule-based trading desk)
 
 ```
-base = size_new_cap(...)         ← start with Chronos vol-targeted size
-if base == 0 or det_sig == 0:   → FLAT (either signal is neutral → no trade)
-if sign(base) ≠ sign(det_sig):  → FLAT (signals disagree → no trade)
-else: return base
+if crack_spread > 10-day SMA:  size = +1 × capital × weight
+if crack_spread < 10-day SMA:  size = -1 × capital × weight
+# 2-day persistence filter prevents whipsaws
 ```
 
-**What it does:** Requires **both** signals to agree before trading. Chronos gives the size; DET has veto power. If either is neutral, or if they point in opposite directions, the position is zero.
+**Economic logic:** A direct implementation of the refinery crack spread trade — the physical economics of turning crude oil into gasoline/diesel.
 
-**Why this works:** Two independent signals agreeing on direction is stronger evidence than either alone. The cost is fewer trades (more time flat). The benefit is higher hit rate on trades that are taken.
+- Crack spread wide (gasoline > crude): refining margins are high → refiners earn more → long refiners
+- Crack spread narrow/negative: margins compressed → short refiners
+
+This is fundamentals-based momentum: not ML, no quantiles, no probability. It encodes the actual commodity desk logic used by Houston energy traders. The 10-day SMA smooths noise; the 2-day confirmation filter prevents reacting to single-day blips.
+
+**Why it outperforms everything (DET: Sharpe 0.44–0.98):** The crack spread is a direct economic driver of refiner profitability. The signal has genuine informational content that Chronos-2 must reconstruct indirectly from price history. The deterministic signal is the ground truth the model is trying to approximate.
 
 ---
 
-## 5.6 — ENS_AVG: Bates-Granger Ensemble
+## 5.5 — ENS_VETO: Ensemble with Veto (Disagreement = no trade)
 
 ```
-avg_q50 = 0.5 × (chronos_q50  +  det_sig × 0.005)
-if sign(avg_q50) ≠ sign(p_up − 0.5):  → FLAT
-edge = avg_q50 / forecast_vol
-size = clip(edge / 0.01, −1, 1) × ticker_capital × vol_cap
+base = size_new_cap(...)       # Chronos says X
+if det_sig == 0: return 0.0    # DET flat → don't trade
+if (base > 0) != (det_sig > 0): return 0.0   # disagree → veto
+return base                     # both agree → Chronos-sized position
 ```
 
-**What it does:** Combines Chronos and DET into a **blended forecast** using the Bates-Granger (1969) equal-weight combination theorem. The DET signal is converted to return units (`det_sig × 0.005`, i.e., ±0.5%/day) and averaged with Chronos's `q50`.
+**Economic logic:** Require consensus between two independent forecasters before committing capital.
 
-**`DET_SIGNAL_MAG = 0.005`:** The DET signal (±1 or 0) is dimensionless. To average it with a return forecast in %/day, we scale it: ±1 × 0.005 = ±0.5% per day, which is roughly the magnitude of a typical refiner move.
+This is a classic signal confirmation approach from multi-factor investing:
+- Chronos captures statistical patterns in price/crack history
+- DET captures the physical commodity economics
 
-**Why Bates-Granger?** A 50-year-old result from econometrics: combining two imperfect forecasts with equal weights almost always outperforms either individually, because the errors partially cancel. This is the theoretical justification for blending the AI and rule-based signals.
+If they agree: high-conviction trade → use Chronos vol-targeted sizing
+If they disagree: uncertainty is high, sit out — the two information sources are contradicting each other
+
+**Why this has the best Sharpe (0.51–0.68):** It dramatically reduces MaxDD (−27.7% vs −54.1% for DET alone) by avoiding trades where the fundamental signal and the ML signal conflict. You give up some return for a much smoother equity curve.
 
 ---
 
-## 5.7 — Sizing Scheme Summary
+## 5.6 — ENS_AVG: Bates-Granger Forecast Combination (1969 forecast averaging)
 
-| Scheme | Uses Chronos | Uses DET | Vol Targeting | When to use it |
-|--------|:---:|:---:|:---:|---|
-| OLD | p_up only | No | No | Baseline / legacy |
-| NEW | Full quantiles | No | Yes | Chronos-only, no risk mgmt |
-| NEW_CAP | Full quantiles | No | Yes + cap | Chronos-only, with risk mgmt |
-| DET | No | Yes | Cap only | Rule-based baseline |
-| ENS_VETO | Yes (size) | Yes (veto) | Yes + cap | Conservative — high hit rate |
-| ENS_AVG | Yes (blended) | Yes (blended) | Yes + cap | Balanced ensemble |
+```
+avg_q50 = 0.5 × (chronos_q50 + det_sig × DET_SIGNAL_MAG)
+edge    = avg_q50 / forecast_vol
+size    = clipped(edge / TARGET_DAILY_VOL) × capital
+```
+
+**Economic logic:** Blend two forecasts into one signal rather than requiring them to agree.
+
+From Bates & Granger (1969): "A combination of forecasts typically beats any single forecast." The blended median:
+- Takes Chronos's q50 (ML quantile prediction)
+- Averages it with `det_sig × 0.005` (DET rescaled to match the return magnitude)
+- Uses the blend as the expected return in the vol-targeting formula
+
+
+
+---
+
+## 5.7 — Summary: The Economic Design Ladder
+
+```
+OLD       →  "what direction?"         No risk control
+NEW       →  "how confident?"          Forecast-risk sizing
+NEW_CAP   →  "is the market calm?"     Realized-risk brake
+DET       →  "what do fundamentals say?" Physical commodity economics
+ENS_VETO  →  "do both agree?"          Conservative consensus
+ENS_AVG   →  "what's the blend?"       Diversified combination
+```
 
 ---
 
 ## 5.8 — Transaction Costs
 
-All schemes apply friction on **position changes** (not on absolute position size):
+All schemes apply friction on **position changes**, not on the level of the position itself:
 
 ```
 friction = |target_size − effective_size| × (10 bps / 10,000)
 ```
 
-**10 bps = 0.10%** per unit of notional traded. Applied every time the strategy increases or decreases its position. A strategy that flips from +$25 to −$25 pays 10 bps on $50 of change.
+**10 bps = 0.10%** per unit of notional changed. A strategy that flips from +$25 to −$25 pays 10 bps on $50 of change ($0.05). Applied every day a position changes; no cost for holding a static position.
 
-**Why on changes, not levels?** You only pay the spread/commission when you transact. Holding a position costs nothing in this model (no borrow cost for simplicity).
+This models the bid-ask spread and commission cost of executing equity trades. The borrow cost for short positions is excluded here — see Script 05 (`spy_default_simulation`) for a full sweep of both transaction costs and borrow costs against the SPY baseline.
 
 ---
 
