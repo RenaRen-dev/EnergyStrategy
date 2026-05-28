@@ -88,3 +88,4 @@ logs/
 
 # === Strategy Data ===
 refiner/refiner_strategy/data/
+refiner/refiner_strategy/outputs/
