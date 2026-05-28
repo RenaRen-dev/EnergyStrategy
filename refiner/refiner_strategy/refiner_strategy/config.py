@@ -36,6 +36,9 @@ SMA_WINDOW: int = 10
 SMA_MIN_PERIODS: int = 5
 CONFIRM_DAYS: int = 2
 
+# Fixed-tenor futures: 3rd prompt = third-nearest live contract
+TENOR_PROMPT: int = 3
+
 # ---------------------------------------------------------------------------
 # Sizing
 # ---------------------------------------------------------------------------

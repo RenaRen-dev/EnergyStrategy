@@ -1,4 +1,4 @@
-"""SPY-default overlay simulator.
+"""SPY-default overlay simulator (Option B — per-ticker accounting).
 
 When the refiner strategy has no position, the capital sits in SPY
 (the "default" allocation).  This module answers: "What if we ran
@@ -8,11 +8,29 @@ portfolio?"
 The key insight is that unused capital earns the market return instead
 of sitting idle, which is a more realistic comparison than standalone
 refiner returns vs SPY buy-and-hold.
+
+Accounting model
+----------------
+Refiner positions are tracked individually per ticker, NOT as a single
+cap-weighted basket.  This matters because each sizing scheme produces
+seven independent position decisions that frequently deviate from the
+cap weights (a long-only basket would have weight VLO=0.25, MPC=0.25,
+...; the strategy might actually hold VLO=+0.25, MPC=-0.10, PSX=+0.20).
+
+Transaction costs are charged on:
+  1. Every individual ticker position change (one leg each)
+  2. The SPY weight change implied by the net allocation shift (one leg)
+
+Portfolio returns are computed from actual held positions and the actual
+per-ticker daily returns, not from a fixed cap-weighted basket return.
+
+PnL accounting uses positions held during the day (yesterday's target),
+not today's target — consistent with the H4 invariant in ab_runner.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from dataclasses import dataclass
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -30,75 +48,135 @@ class SpyDefaultConfig:
     leverage_cap: float = 1.0
 
 
-def fetch_unhedged_returns(test_end: str | None = None) -> pd.Series:
-    """Download TICKERS prices from yfinance and return cap-weighted basket returns."""
+def fetch_per_ticker_returns(test_end: str | None = None) -> pd.DataFrame:
+    """Download TICKERS prices and return per-ticker daily returns as a DataFrame.
+
+    Columns: one per ticker.  Rows: dates.  Values: pct_change daily returns.
+    """
     raw = yf.download(TICKERS, start="2014-01-01", end=test_end, progress=False, auto_adjust=False)
     if raw.empty:
         raise RuntimeError("yfinance returned empty data for equity tickers")
     close = raw["Close"]
     rets = close.pct_change().dropna()
+    return rets
 
+
+def fetch_unhedged_returns(test_end: str | None = None) -> pd.Series:
+    """Cap-weighted basket return (kept for backward compatibility / diagnostic use)."""
+    rets = fetch_per_ticker_returns(test_end=test_end)
     basket = sum(rets[t] * AB_WEIGHTS[t] for t in TICKERS)
     return basket
 
 
 def simulate_spy_default(
     spy_returns: pd.Series,
-    refiner_returns: pd.Series,
+    ticker_returns: pd.DataFrame,
     trades_df: pd.DataFrame,
     config: SpyDefaultConfig | None = None,
     strategy_notional: float = 100.0,
 ) -> dict:
-    """Simulate a SPY-default portfolio with refiner overlay.
+    """Simulate a SPY-default portfolio with refiner overlay using per-ticker accounting.
 
-    Returns dict with nav_series and metrics.
+    Parameters
+    ----------
+    spy_returns : daily SPY returns
+    ticker_returns : DataFrame of daily per-ticker returns (columns = ticker symbols)
+    trades_df : trade log from ab_runner with columns
+                (date, ticker, target_size, effective_size, actual_ret, ...)
+    config : cost assumptions
+    strategy_notional : reference notional used by the upstream sizing schemes
+
+    Returns
+    -------
+    dict with 'nav_series' (pd.Series) and 'metrics' (dict)
     """
     if config is None:
         config = SpyDefaultConfig()
 
-    # Daily allocation = sum of target_size / notional
-    alloc_by_date = trades_df.groupby("date")["target_size"].sum() / strategy_notional
+    # Pivot trades into a (date × ticker) matrix of target sizes
+    tickers = sorted(trades_df["ticker"].unique())
+    positions_by_date = trades_df.pivot_table(
+        index="date",
+        columns="ticker",
+        values="target_size",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).reindex(columns=tickers, fill_value=0.0)
 
-    common_idx = spy_returns.index.intersection(alloc_by_date.index)
+    common_idx = spy_returns.index.intersection(positions_by_date.index)
     if common_idx.empty:
         return {"nav_series": pd.Series(dtype=float), "metrics": {}}
 
     nav = [1.0]
-    prev_alloc = 0.0
+    prev_pos_frac: Dict[str, float] = {t: 0.0 for t in tickers}
+    prev_spy_weight = 1.0  # start fully in SPY
 
-    for i, date in enumerate(common_idx):
-        alloc = float(alloc_by_date.get(date, 0.0))
-        alloc = max(-config.leverage_cap, min(config.leverage_cap, alloc))
+    for date in common_idx:
+        # Target positions for this date, expressed as fractions of notional
+        target_pos_frac = {
+            t: float(positions_by_date.loc[date, t]) / strategy_notional
+            for t in tickers
+        }
 
+        # Net allocation to refiners, clipped to the leverage cap
+        target_alloc = sum(target_pos_frac.values())
+        target_alloc_clipped = max(
+            -config.leverage_cap, min(config.leverage_cap, target_alloc)
+        )
+        target_spy_weight = 1.0 - abs(target_alloc_clipped)
+
+        # ── Returns earned today (using YESTERDAY's positions — H4 invariant) ──
         spy_ret = float(spy_returns.get(date, 0.0))
-        ref_ret = float(refiner_returns.get(date, 0.0)) if date in refiner_returns.index else 0.0
+        refiner_contrib = 0.0
+        for t in tickers:
+            if t in ticker_returns.columns and date in ticker_returns.index:
+                t_ret = ticker_returns.loc[date, t]
+                if not pd.isna(t_ret):
+                    refiner_contrib += prev_pos_frac[t] * float(t_ret)
+        spy_contrib = prev_spy_weight * spy_ret
+        gross_port_ret = refiner_contrib + spy_contrib
 
-        # Portfolio return: (1 - |alloc|) in SPY + alloc in refiners
-        spy_weight = 1.0 - abs(alloc)
-        port_ret = spy_weight * spy_ret + alloc * ref_ret
+        # ── Transaction costs on the close-of-day rebalance ──
+        # Per-ticker: each position change is one leg
+        ticker_legs = sum(
+            abs(target_pos_frac[t] - prev_pos_frac[t]) for t in tickers
+        )
+        ticker_cost = ticker_legs * (config.txn_cost_bps_per_leg / 10_000)
 
-        # Transaction costs: 2x per-leg on allocation changes
-        alloc_change = abs(alloc - prev_alloc)
-        txn_cost = alloc_change * 2 * (config.txn_cost_bps_per_leg / 10_000)
+        # SPY: the implied weight change is one leg
+        spy_cost = abs(target_spy_weight - prev_spy_weight) * (
+            config.txn_cost_bps_per_leg / 10_000
+        )
 
-        # Borrow cost on short allocation
-        if alloc < 0:
-            borrow = abs(alloc) * (config.borrow_cost_bps_per_year / 10_000) / TRADING_DAYS_PER_YEAR
-        else:
-            borrow = 0.0
+        total_txn_cost = ticker_cost + spy_cost
 
-        daily_nav_ret = port_ret - txn_cost - borrow
+        # ── Borrow cost on yesterday's short positions (held during the day) ──
+        prev_short_exposure = sum(abs(p) for p in prev_pos_frac.values() if p < 0)
+        borrow = (
+            prev_short_exposure
+            * (config.borrow_cost_bps_per_year / 10_000)
+            / TRADING_DAYS_PER_YEAR
+        )
+
+        # ── NAV update ──
+        daily_nav_ret = gross_port_ret - total_txn_cost - borrow
         nav.append(nav[-1] * (1 + daily_nav_ret))
-        prev_alloc = alloc
+
+        # Roll state forward
+        for t in tickers:
+            prev_pos_frac[t] = target_pos_frac[t]
+        prev_spy_weight = target_spy_weight
 
     nav_series = pd.Series(nav[1:], index=common_idx)
 
-    # Compute metrics from daily returns
+    # Metrics
     daily_rets = nav_series.pct_change().dropna()
     mu = daily_rets.mean()
     sigma = daily_rets.std()
     ann_ret = float(mu * TRADING_DAYS_PER_YEAR)
-    sharpe = float(np.sqrt(TRADING_DAYS_PER_YEAR) * mu / sigma) if sigma > 0 else 0.0
+    sharpe = (
+        float(np.sqrt(TRADING_DAYS_PER_YEAR) * mu / sigma) if sigma > 0 else 0.0
+    )
 
     running_max = nav_series.cummax()
     drawdown = (nav_series - running_max) / running_max
@@ -122,7 +200,9 @@ def compare_to_spy_only(spy_returns: pd.Series) -> dict:
     mu = daily_rets.mean()
     sigma = daily_rets.std()
     ann_ret = float(mu * TRADING_DAYS_PER_YEAR)
-    sharpe = float(np.sqrt(TRADING_DAYS_PER_YEAR) * mu / sigma) if sigma > 0 else 0.0
+    sharpe = (
+        float(np.sqrt(TRADING_DAYS_PER_YEAR) * mu / sigma) if sigma > 0 else 0.0
+    )
 
     running_max = nav.cummax()
     drawdown = (nav - running_max) / running_max
