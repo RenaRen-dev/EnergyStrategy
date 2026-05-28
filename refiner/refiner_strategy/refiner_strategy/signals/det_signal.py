@@ -14,8 +14,17 @@ from __future__ import annotations
 
 import pandas as pd
 
-from refiner_strategy.config import CONFIRM_DAYS, DATA_START, SMA_MIN_PERIODS, SMA_WINDOW
-from refiner_strategy.data.futures_loader import load_continuous_crack
+from refiner_strategy.config import (
+    CONFIRM_DAYS,
+    DATA_START,
+    SMA_MIN_PERIODS,
+    SMA_WINDOW,
+    TENOR_PROMPT,
+)
+from refiner_strategy.data.futures_loader import (
+    load_continuous_crack,
+    load_fixed_tenor_crack,
+)
 
 
 def _confirm(raw_sig: pd.Series, n: int) -> pd.Series:
@@ -29,13 +38,26 @@ def _confirm(raw_sig: pd.Series, n: int) -> pd.Series:
 def build_det_signal(
     start: str = DATA_START,
     end: str | None = None,
+    tenor_prompt: int = TENOR_PROMPT,
 ) -> pd.DataFrame:
     """Build DET signal from live yfinance data.
+
+    Uses fixed-tenor (Nth-prompt) crack spread by default to avoid the
+    roll-day discontinuities of the front-month series.  Falls back to
+    front-month if Yahoo Finance has insufficient history for the
+    requested tenor.
 
     Returns DataFrame with Crack_Spread, SMA10, raw_sig, det_sig.
     The det_sig is UNLAGGED — caller must .shift(1) before use.
     """
-    crack_df = load_continuous_crack(start=start, end=end)
+    try:
+        crack_df = load_fixed_tenor_crack(start=start, end=end, tenor_prompt=tenor_prompt)
+    except RuntimeError as exc:
+        print(
+            f"[det_signal] Fixed-tenor (prompt={tenor_prompt}) unavailable "
+            f"({exc}); falling back to front-month continuous crack spread."
+        )
+        crack_df = load_continuous_crack(start=start, end=end)
     crack = crack_df["Crack_Spread"]
 
     sma = crack.rolling(SMA_WINDOW, min_periods=SMA_MIN_PERIODS).mean()
@@ -56,9 +78,12 @@ def build_det_signal(
     )
 
 
-def build_stitched_det_signal(test_end: str | None = None) -> pd.Series:
+def build_stitched_det_signal(
+    test_end: str | None = None,
+    tenor_prompt: int = TENOR_PROMPT,
+) -> pd.Series:
     """Return the full unlagged det_sig Series up to *test_end*."""
-    df = build_det_signal(start=DATA_START, end=test_end)
+    df = build_det_signal(start=DATA_START, end=test_end, tenor_prompt=tenor_prompt)
     return df["det_sig"]
 
 

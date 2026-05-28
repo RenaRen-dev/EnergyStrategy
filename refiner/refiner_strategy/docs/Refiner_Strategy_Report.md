@@ -1,25 +1,25 @@
-# AI Refiner Strategy: Full Project Report
-## Target: 7 US Oil Refiner Equities | Horizon: 1 Business Day
-**Author:** Tianyu Shi | **Date:** May 2026
+# AI Refiner Backtest 
+**Author:** Xinyi Ren | **Date:** May 2026
 
 ---
 
 # Part 1: Strategy Overview
 
-*Goal: Build a long/short equity strategy on US oil refiners that strips out broad market noise and exploits the refining margin cycle.*
-
 ---
 
 ## 1.1 — The Core Idea
 
-Oil refiners (VLO, MPC, PSX, DINO, PBF, DK, CVI) make money on the **crack spread** — the difference between what they buy (crude oil) and what they sell (gasoline, heating oil). When the crack spread is wide, refiners are profitable. When it collapses, their margins disappear.
+**DET:**
+- **Daily execution:** Crack spread is positive $\rightarrow$ long (size = 100%)
+- **Returns:** Accumulate daily returns
+- **Friction:** Subtract transaction costs
+- **Idle capital:** Unallocated capital is invested in SPY
 
-This strategy trades on that cycle in two layers:
-
-1. **Deterministic layer (DET):** A rule-based signal based on crack spread momentum — the same signal used by the Houston Products Desk. Fast, transparent, always running.
-2. **AI layer (Chronos-2):** An AI time-series model that forecasts next-day hedged returns using the crack spread as a covariate. Adds probabilistic conviction on top of the DET rule.
-
-Both signals feed into **6 sizing schemes** tested in a full A/B backtest. The goal is to find which combination of rule + AI produces the best risk-adjusted return.
+**Different Models:**
+- **Daily execution:** Crack spread + AI signal $\rightarrow$ long/short (dynamic sizing = ?)
+- **Returns:** Accumulate daily returns
+- **Friction:** Subtract transaction costs
+- **Idle capital:** Unallocated capital is invested in SPY
 
 ---
 
@@ -37,102 +37,23 @@ Both signals feed into **6 sizing schemes** tested in a full A/B backtest. The g
 
 **Why these weights?** VLO, MPC, and PSX dominate — they are the three largest independent US refiners by throughput capacity and have the deepest liquidity. The smaller names (DINO, PBF, DK, CVI) receive smaller allocations because they are more idiosyncratic and harder to execute.
 
+**How DET Uses These Weights**
+
+Example: If notional = $100 and DET signal = +1 (bullish):
+- `position[VLO]` = +1 × ($100 × 0.25) = +$25  ← always this much when signal is +1
+- `position[MPC]` = +1 × ($100 × 0.25) = +$25   
+- `position[PSX]` = +1 × ($100 × 0.25) = +$25
+
+**How AI Models Use These Weights**
+
+Same example, with AI model:  
+- If Chronos predicts: q50 = +0.5%, q90 = +1.0%, q10 = −0.1%
+- Then: forecast_vol = 0.39%, edge = 1.28%, raw_size = 0.8x (clipped = 0.8)
+- So: `position[VLO]` = 0.8 × ($100 × 0.25) = +$20 (less than DET's +$25)
+
 ---
 
 # Part 2: Data Infrastructure
-
-*Goal: Build a clean dataset where every column is economically meaningful and free of look-ahead bias.*
-
----
-
-## 2.1 — Futures Data & Crack Spread (`data/futures_loader.py`)
-
-**What:** Downloads front-month WTI Crude (CL), RBOB Gasoline (RB), and Heating Oil (HO) futures from yfinance. Computes the **3:2:1 crack spread**.
-
-**The 3:2:1 formula:**
-
-```
-Crack Spread ($/bbl) = (2 × RB_price × 42  +  HO_price × 42) / 3  −  CL_price
-```
-
-The 3:2:1 ratio means: for every 3 barrels of crude input, a refinery produces approximately 2 barrels of gasoline and 1 barrel of heating oil.
-
-**Multiply by 42:** RB and HO futures are quoted in dollars per gallon. Multiply by 42 (gallons per barrel) to convert them to the same $/bbl unit as crude.
-
-**Why the crack spread matters:**  
-The crack spread is the *real-time profit margin* of refining. It tells you whether the market expects refiners to be profitable right now. A rising crack = improving margins = buy refiners. A falling crack = margin compression = short refiners.
-
-**yfinance column ordering gotcha:**
-```python
-# We ask for ["CL=F", "RB=F", "HO=F"]
-# But yfinance returns columns alphabetically: [CL=F, HO=F, RB=F]
-close.columns = ["CL", "HO", "RB"]   # must match the alphabetical order
-```
-Getting this wrong would silently swap gasoline and heating oil prices, corrupting every downstream calculation.
-
----
-
-## 2.2 — Equity Prices & Returns (`data/build_dataset.py`)
-
-**What:** Downloads adjusted-close prices for all 7 refiners plus SPY (the S&P 500 ETF) from yfinance. Computes daily log returns.
-
-**Why SPY?** Refiners are not pure commodity plays — they carry significant market beta. When the S&P sells off, refiners fall too, regardless of the crack spread. To isolate the refining-margin signal we need to strip out this market exposure. SPY is our market proxy.
-
----
-
-## 2.3 — Hedged Returns: Stripping Out Market Beta
-
-**The problem:** If VLO has a beta of 1.2, then 1.2% of every 1% SPY move is just "market noise" — it has nothing to do with refiner margins. Trading on raw VLO returns means you are mostly just trading the S&P 500.
-
-**The fix — beta-hedged returns:**
-
-```
-Hedged_Return(t) = Raw_Return(t)  −  Beta(t−1) × SPY_Return(t)
-```
-
-Where Beta is a 60-day rolling OLS estimate:
-
-```
-Beta(t) = Cov(Asset_Returns, SPY_Returns) / Var(SPY_Returns)
-          computed over the last 60 trading days
-```
-
-**H5 correctness fix — beta is lagged:**  
-We use Beta(t−1), not Beta(t). Computing beta with today's return and then using it to hedge today's return would be look-ahead bias. Today's beta must use only data available at yesterday's close.
-
-**End-to-end example:**
-
-```
-VLO Raw Return today:    +2.1%
-SPY Return today:        +1.5%
-VLO Rolling Beta (t−1):  1.20
-
-VLO Hedged Return = +2.1%  −  (1.20 × 1.5%)  =  +2.1%  −  1.8%  =  +0.3%
-```
-
-The hedged return tells us: VLO earned +0.3% *above and beyond* what the market predicted. That is the refiner alpha we want to trade.
-
----
-
-## 2.4 — Crack Spread Z-Score
-
-**What:** A 256-day rolling Z-score of the crack spread.
-
-```
-Crack_Z_Score(t) = (Crack_Spread(t) − Rolling_Mean_256d) / Rolling_Std_256d
-```
-
-Clipped to [-3.0, +3.0].
-
-**H1 correctness fix — unified Z-score:**  
-The Z-score is computed once on the *full* crack series from 2014, not recomputed for each fold or test window. Re-normalizing per fold would reset the baseline, making a +$5/bbl crack spread "look normal" in one fold and "look high" in another. A unified Z-score preserves the absolute level of the margin cycle.
-
-**What the Chronos model sees:**  
-Chronos-2 receives two inputs: `[hedged_return × 100, crack_Z_score]`. The Z-score tells the model where we are in the refining margin cycle. A high Z-score (+2.0) says "margins are unusually strong right now" — providing context the model uses to sharpen its return forecast.
-
----
-
-## 2.5 — Data Pipeline: End-to-End Example
 
 Follow one trading day through every step:
 
@@ -340,7 +261,7 @@ Each fold uses a deterministic seed: `fold_seed = 42 + fold_idx`. This ensures r
 
 ---
 
-# Part 5: The 6 Sizing Schemes
+# Part 5: Determine the 6 strategies holding size everyday (The 6 Sizing Schemes)
 
 *The core problem all sizers solve: given a Chronos-2 forecast and a crack-spread signal, how much capital should we commit to a refiner stock today?*
 
@@ -485,81 +406,49 @@ ENS_AVG   →  "what's the blend?"       Diversified combination
 
 ## 5.8 — Transaction Costs
 
-All schemes apply friction on **position changes**, not on the level of the position itself:
-
+**1. Ticker Friction (all individual stock position changes)**
+```text
+ticker_cost = Σ |Δposition_ticker| × (bps_per_leg / 10,000)
 ```
-friction = |target_size − effective_size| × (10 bps / 10,000)
+For each ticker $t$, sum the absolute change: `|target_pos_frac[t] - prev_pos_frac[t]|`
+
+**2. SPY Friction (the macro allocation lever)**
+```text
+spy_cost = |Δspy_weight| × (bps_per_leg / 10,000)
+```
+Where `spy_weight = 1 - |net_refiner_allocation|`
+
+**3. Borrow Cost (on yesterday's shorts, daily accrual)**
+```text
+borrow = Σ max(0, -position_t) × (borrow_bps_per_year / 10,000) / 252
+```
+Sum all negative positions, annualize the rate, and accrue daily.
+
+**4. Total Daily Friction:**
+```text
+net_return = gross_return - ticker_cost - spy_cost - borrow
 ```
 
-**10 bps = 0.10%** per unit of notional changed. A strategy that flips from +$25 to −$25 pays 10 bps on $50 of change ($0.05). Applied every day a position changes; no cost for holding a static position.
-
-This models the bid-ask spread and commission cost of executing equity trades. The borrow cost for short positions is excluded here — see Script 05 (`spy_default_simulation`) for a full sweep of both transaction costs and borrow costs against the SPY baseline.
 
 ---
 
-# Part 6: A/B Evaluation Framework
+# Part 6: The SPY-Default Strategy
 
-*Goal: Run all 6 schemes through an identical backtest to find which adds the most value.*
 
----
-
-## 6.1 — The A/B Harness (`evaluation/ab_runner.py`)
-
-All 6 schemes run through the **same** loop with the **same** accounting rules. No scheme gets an advantage from a different implementation.
-
-**Correctness invariant — strict look-ahead prevention:**
-```python
-history = df[df.index < T]   # strict < : today's data excluded
-```
-On every test day T, the model only sees data from *before* T. Never same-day or future data.
-
-**Two execution modes sharing identical accounting logic:**
-- `run_ab_zero_shot`: Runs Chronos live on each day (no fine-tuning). Good for baseline comparison.
-- `replay_with_predictions`: Reads predictions pre-saved from walk-forward folds. Used to evaluate the LoRA fine-tuned model.
-
----
-
-## 6.2 — One Day in the Backtest Loop
+On each trading day, the portfolio is split between the refiner overlay and passive SPY:
 
 ```
-For each trading day T in test_dates:
+alloc = net refiner allocation (between -1.0 and +1.0)
 
-  1. history = all data strictly before T
-  2. For each ticker:
-       - Run Chronos on history (or load pre-saved prediction)
-       - Get {q10, ..., q90, p_up}
-  3. Compute realized vol from trailing 20-day hedged return std
-  4. Get DET signal from lagged crack spread
-  5. For each scheme:
-       a. target_size = sizer(pred, det_sig, ...)    ← what we want to hold
-       b. effective_size = what we held yesterday    ← what earns/loses today
-       c. PnL = effective_size × actual_return − friction(|target − effective|)
-       d. Record trade, update position to target_size
-  6. Move to T+1
+Portfolio Return = (1 - |alloc|) × SPY_Return  +  alloc × Refiner_Return
+                   └── passive ──┘                └── active overlay ──┘
 ```
 
-**H4 correctness fix — effective_size:**  
-The position that earns today's return is what we held at yesterday's close (`effective_size`), not what we just decided (`target_size`). The decision made today only takes effect at today's close, earning tomorrow's return. Using `target_size` for today's PnL would be look-ahead bias in the execution model.
+
 
 ---
 
-## 6.3 — Performance Metrics (`evaluation/metrics.py`)
 
-All metrics are computed from the daily PnL series:
-
-| Metric | Formula | Meaning |
-|--------|---------|---------|
-| **Ann. Return** | `mean_daily_ret × 252` | Annualized expected return |
-| **Sharpe** | `mean_daily_ret / std × √252` | Return per unit of total risk |
-| **Sortino** | `mean / downside_std × √252` | Return per unit of downside risk |
-| **Max Drawdown** | `min((cum_ret − running_max) / running_max)` | Worst peak-to-trough decline |
-| **Calmar** | `ann_ret / |max_drawdown|` | Return per unit of drawdown risk |
-| **Hit Rate** | `% of active days where position × return > 0` | Directional accuracy |
-
-**Hit rate uses `effective_size` (H4):**  
-A trade "hits" when the position held at open earns a positive return by close. Using `target_size` (the decision) instead of `effective_size` (the holding) would misattribute gains to decisions that hadn't yet taken effect.
-
----
 
 # Part 7: Running the Strategy
 
@@ -567,85 +456,56 @@ A trade "hits" when the position held at open earns a positive return by close. 
 
 ---
 
-## 7.1 — Execution Order
 
-### Step 0 — Smoke tests (verify your environment)
-```
-cd refiner/refiner_strategy
-python tests/smoke_chronos.py      # confirms Chronos-2 loads and predicts
-python tests/smoke_fit.py          # confirms LoRA fine-tuning API works
-python tests/test_sizing.py        # confirms all 6 sizing schemes are correct
-```
-
-### Step 1 — Build the master dataset
-```
-python scripts/01_build_datasets.py
-```
-Downloads futures + equity prices from yfinance. Computes crack spread, Z-score, rolling betas, and hedged returns. Saves `outputs/<run_dir>/datasets/master.csv`.
-
-**Runtime:** ~1–2 minutes (network dependent).
-
-### Step 2 — Walk-forward LoRA fine-tuning
-```
-python scripts/02_run_finetune_walkforward.py --run-dir outputs/<run_dir>
-```
-Runs 17 purged folds. For each fold, fine-tunes Chronos-2 with LoRA and generates predictions on the 6-month test window. Saves `fold_00.parquet` through `fold_16.parquet`.
-
-**Runtime:** Several hours on CPU (each fold = 200 gradient steps on 2 years of data).
-
-### Step 3a — A/B evaluation (fine-tuned predictions)
-```
-python scripts/03_run_ab_finetuned.py --run-dir outputs/<run_dir>
-```
-Replays all 17 folds' predictions through 6 sizing schemes. Prints performance table.
-
-### Step 3b — A/B evaluation (zero-shot baseline)
-```
-python scripts/04_run_ab_zero_shot.py --run-dir outputs/<run_dir>
-```
-Same A/B harness but runs live Chronos inference on every test day (no fine-tuning). Provides the baseline: does fine-tuning actually help?
-
-### Step 4 — SPY-default overlay
-```
-python scripts/05_run_spy_default_simulation.py --run-dir outputs/<run_dir>
-```
-Sweeps SPY-overlay configurations and compares against SPY buy-and-hold.
-
----
 
 ## 7.2 — Output Table Format
 
-```
-Scheme       Ann Ret     Sharpe    MaxDD   Hit Rate      N
-──────────────────────────────────────────────────────────
-OLD           +4.21%       0.61   -18.3%      0.523    847
-NEW           +6.84%       0.92   -12.1%      0.558    601
-NEW_CAP       +7.12%       1.04   -10.8%      0.561    601
-DET           +5.43%       0.78   -14.2%      0.541    712
-ENS_VETO      +8.21%       1.18    -9.3%      0.582    388
-ENS_AVG       +7.98%       1.15    -9.7%      0.571    512
+```text
+Scheme   TradeCost(bps) BorrowCost Ann Ret   Sharpe    MaxDD     Edge
+--------------------------------------------------------------------
+DET                10        0    +20.09%     0.70   -50.4%    +6.88pp
+DET                10       50    +19.94%     0.69   -50.4%    +6.73pp
+DET                15        0    +17.37%     0.60   -52.0%    +4.16pp
+DET                15       50    +17.22%     0.60   -52.1%    +4.01pp
+DET                20        0    +14.65%     0.51   -53.9%    +1.44pp
+DET                20       50    +14.50%     0.50   -54.0%    +1.29pp
+DET                25        0    +11.93%     0.41   -55.7%    -1.28pp
+DET                25       50    +11.78%     0.41   -55.8%    -1.43pp
+ENS_VETO           10        0    +22.73%     1.01   -34.8%    +9.52pp
+ENS_VETO           10       50    +22.65%     1.00   -34.9%    +9.44pp
+ENS_VETO           15        0    +20.06%     0.89   -37.2%    +6.86pp
+ENS_VETO           15       50    +19.98%     0.88   -37.2%    +6.78pp
+ENS_VETO           20        0    +17.40%     0.77   -39.5%    +4.19pp
+ENS_VETO           20       50    +17.32%     0.77   -39.6%    +4.11pp
+ENS_VETO           25        0    +14.73%     0.65   -41.8%    +1.53pp
+ENS_VETO           25       50    +14.65%     0.65   -41.8%    +1.44pp
+ENS_AVG            10        0    +26.64%     1.10   -30.2%   +13.44pp
+ENS_AVG            10       50    +26.51%     1.09   -30.3%   +13.31pp
+ENS_AVG            15        0    +23.25%     0.96   -32.5%   +10.04pp
+ENS_AVG            15       50    +23.12%     0.95   -32.6%    +9.91pp
+ENS_AVG            20        0    +19.85%     0.82   -34.8%    +6.65pp
+ENS_AVG            20       50    +19.73%     0.81   -34.9%    +6.52pp
+ENS_AVG            25        0    +16.46%     0.68   -36.9%    +3.25pp
+ENS_AVG            25       50    +16.33%     0.67   -37.0%    +3.12pp
+NEW_CAP            10        0    +17.22%     0.68   -37.8%    +4.02pp
+NEW_CAP            10       50    +17.03%     0.67   -37.9%    +3.83pp
+NEW_CAP            15        0    +13.37%     0.53   -43.8%    +0.16pp
+NEW_CAP            15       50    +13.18%     0.52   -44.3%    -0.03pp
+NEW_CAP            20        0     +9.52%     0.37   -52.7%    -3.69pp
+NEW_CAP            20       50     +9.33%     0.37   -53.1%    -3.88pp
+NEW_CAP            25        0     +5.66%     0.22   -60.1%    -7.55pp
+NEW_CAP            25       50     +5.47%     0.22   -60.5%    -7.74pp
 ```
 
 **Reading the table:**
-- **ENS_VETO** typically has the fewest trades (N) but the highest hit rate — it only trades when both signals agree
-- **OLD** has the most trades — the probability-only logic has no vol floor or consensus gate
-- **Sharpe > 1.0** is the target for a strategy worth deploying
+- **ENS_AVG** achieves the highest overall returns and Sharpe ratio across all transaction cost regimes.
+- **ENS_VETO** provides the second best performance, maintaining strong Sharpe ratios and edges over the SPY benchmark.
+- **Sharpe > 1.0** is achieved in the lowest transaction cost tiers (10 bps) for both ensemble strategies, which is the target for a strategy worth deploying.
+- Increasing **BPS RT** heavily impacts returns, indicating the strategy is sensitive to trading friction.
+- Adding **Borrow** costs (50 bps) only marginally reduces the annualized returns, showing short-selling borrow fees are not the primary drag on performance.
 
 ---
 
-# Part 8: Key Correctness Invariants
-
-A summary of the five critical correctness fixes in the codebase. Each one prevents a specific type of look-ahead bias or data contamination.
-
-| Code | Fix | Where | What Goes Wrong Without It |
-|------|-----|--------|---------------------------|
-| **H1** | Unified Z-score on full crack series | `build_dataset.py` | Per-fold Z-score resets make +$40 crack look "normal" in one fold and "extreme" in another |
-| **H3** | Per-fold seed: `42 + fold_idx` | `walkforward.py` | Different runs produce different LoRA weights → results not reproducible |
-| **H4** | `effective_size` for PnL & hit rate | `ab_runner.py`, `metrics.py` | Counting today's decision against today's return → measuring decisions that haven't executed yet |
-| **H5** | Rolling beta lagged by 1 day | `build_dataset.py` | Using today's return to compute today's beta → beta already "knows" the return it is hedging |
-| **Strict <** | `history = df[df.index < T]` | `ab_runner.py`, `walkforward.py` | Current day's data leaks into the prediction for that same day |
-
----
 
 # Appendix: Repository Structure
 

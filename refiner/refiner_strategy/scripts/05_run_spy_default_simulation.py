@@ -15,7 +15,7 @@ from refiner_strategy.evaluation.ab_runner import replay_with_predictions
 from refiner_strategy.evaluation.spy_default_simulator import (
     SpyDefaultConfig,
     compare_to_spy_only,
-    fetch_unhedged_returns,
+    fetch_per_ticker_returns,
     simulate_spy_default,
 )
 from refiner_strategy.finetune.walkforward import load_all_predictions
@@ -25,8 +25,8 @@ from refiner_strategy.data.build_dataset import build_master_dataset
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SPY-default simulation sweep")
-    parser.add_argument("--bps", nargs="+", type=float, default=[10, 15, 20, 25])
-    parser.add_argument("--borrow", nargs="+", type=float, default=[0, 50])
+    parser.add_argument("--bps", nargs="+", type=float, default=[10, 15, 20, 25], help="Transaction costs (bps)")
+    parser.add_argument("--borrow", nargs="+", type=float, default=[0, 50], help="Short selling borrow costs (bps)")
     parser.add_argument("--schemes", nargs="+", default=["DET", "ENS_VETO", "ENS_AVG", "NEW_CAP"])
     parser.add_argument("--run-dir", type=str, default=None)
     args = parser.parse_args()
@@ -52,9 +52,9 @@ def main() -> None:
     # Run A/B to get trades
     ab_results = replay_with_predictions(master, preds, det_lagged, schemes=tuple(args.schemes))
 
-    # Get SPY returns and unhedged refiner returns
+    # Get SPY returns and per-ticker refiner returns (Option B accounting)
     spy_ret = master["SPY_Return"]
-    refiner_ret = fetch_unhedged_returns(test_end=test_end)
+    ticker_rets = fetch_per_ticker_returns(test_end=test_end)
 
     # SPY baseline
     spy_baseline = compare_to_spy_only(spy_ret)
@@ -75,7 +75,7 @@ def main() -> None:
                 )
                 result = simulate_spy_default(
                     spy_returns=spy_ret,
-                    refiner_returns=refiner_ret,
+                    ticker_returns=ticker_rets,
                     trades_df=trades_df,
                     config=config,
                 )

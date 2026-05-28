@@ -85,3 +85,6 @@ logs/
 *.tmp
 *.bak
 *.orig
+
+# === Strategy Data ===
+refiner/refiner_strategy/data/
