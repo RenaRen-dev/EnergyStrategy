@@ -8,3 +8,4 @@ peft>=0.7
 transformers>=4.36
 matplotlib>=3.8
 scikit-learn>=1.3
+databento>=0.34  # real M3 crack futures (scripts/00_download_databento_futures.py)

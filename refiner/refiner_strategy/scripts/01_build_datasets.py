@@ -1,5 +1,7 @@
 """Build master dataset from yfinance and save to outputs directory."""
-from __future__ import annotations
+#  The output starts at 2016-01-11 because the Z-score computation requires a 256-day warmup window from __future__ import annotations
+# So the first 256 trading days (roughly 1 year of 2015) produce NaN for Crack_Z_Score — those rows are dropped. That's why the dataset starts ~2016-01-11 instead of 2015-01-01.
+# $VENV scripts/01_build_datasets.py --label m3_real --end 2026-05-27
 
 import argparse
 import sys

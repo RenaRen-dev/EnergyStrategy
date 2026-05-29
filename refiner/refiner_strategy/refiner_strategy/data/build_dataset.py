@@ -10,6 +10,7 @@ Key correctness invariants preserved here:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -20,8 +21,14 @@ from refiner_strategy.config import (
     AB_WEIGHTS,
     BETA_WINDOW,
     DATA_START,
+    LOCAL_DATA_DIR,
+    TENOR_PROMPT,
     TICKERS,
     Z_SCORE_WINDOW,
+)
+from refiner_strategy.data.futures_loader import (
+    load_fixed_tenor_crack_with_contracts,
+    load_real_m3_crack,
 )
 
 
@@ -44,6 +51,101 @@ def _download_prices(
     return close
 
 
+def _load_local_close(symbol: str) -> pd.Series | None:
+    """Load Close series for *symbol* from local cache or bundle.
+
+    Checks cache dir first (user downloads via script 00), then falls back to
+    the bundled CSV (≤2021). Returns None if neither exists, so the caller can
+    fall back to yfinance.
+    """
+    # Try cache first
+    cache_path = Path(LOCAL_DATA_DIR).parent / "cache" / f"{symbol}_daily.csv"
+    for path in [cache_path, LOCAL_DATA_DIR / f"{symbol}_daily.csv"]:
+        if not path.is_file():
+            continue
+        try:
+            df = pd.read_csv(path, parse_dates=["date"]).set_index("date")
+            if "Close" in df.columns:
+                return df["Close"].astype(float).sort_index()
+        except (ValueError, KeyError, pd.errors.ParserError):
+            continue
+    return None
+
+
+def _fetch_recent_close(symbol: str, start: str, end: str | None) -> pd.Series:
+    """Yahoo Finance Close for one symbol as a Series (robust to column shape)."""
+    raw = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=False)
+    if raw.empty or "Close" not in raw.columns:
+        return pd.Series(dtype=float, name=symbol)
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]  # single ticker → first (only) column
+    return close.astype(float)
+
+
+def _load_equity_close_local_plus_yf(
+    symbols: List[str],
+    start: str,
+    end: str | None,
+) -> pd.DataFrame:
+    """Close prices using bundled CSVs for history and yfinance for recent data.
+
+    For each symbol: take the local CSV (≤2021) and append yfinance bars for
+    every date after the CSV's last day (≥2022) up to *end*.  Symbols without a
+    bundled CSV fall back entirely to yfinance.  This keeps the training-era
+    history shape from the in-house export while still extending through the
+    live test period (README data-range requirement).
+
+    The bundle and yfinance use different adjustment bases (the bundle is
+    dividend-adjusted to its snapshot date, yfinance's auto_adjust=False is not).
+    To avoid a spurious return at the junction, the local segment is rescaled by
+    the price ratio at the last overlapping date so the two segments are
+    continuous on yfinance's current basis.
+    """
+    series: dict[str, pd.Series] = {}
+    yf_only: List[str] = []
+
+    for sym in symbols:
+        local = _load_local_close(sym)
+        if local is None:
+            yf_only.append(sym)
+            continue
+        local = local.loc[local.index >= pd.Timestamp(start)]
+        if local.empty:
+            # Local CSV doesn't cover the start date; use yfinance only for this symbol.
+            yf_only.append(sym)
+            continue
+        last_local = local.index.max()
+
+        # Fetch with a short lookback so we get an overlap day to rescale on.
+        overlap_start = (last_local - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        recent = _fetch_recent_close(sym, start=overlap_start, end=end)
+
+        if not recent.empty:
+            common = local.index.intersection(recent.index)
+            if len(common) > 0:
+                ref = common.max()
+                scale = recent.loc[ref] / local.loc[ref]
+                if pd.notna(scale) and scale > 0:
+                    local = local * scale
+            recent = recent.loc[recent.index > last_local]
+
+        combined = pd.concat([local, recent])
+        combined = combined[~combined.index.duplicated(keep="first")].sort_index()
+        series[sym] = combined
+
+    if yf_only:
+        yf_close = _download_prices(yf_only, start=start, end=end)
+        for sym in yf_only:
+            series[sym] = yf_close[sym]
+
+    close = pd.DataFrame(series)
+    close = close.loc[close.index >= pd.Timestamp(start)]
+    if end is not None:
+        close = close.loc[close.index <= pd.Timestamp(end)]
+    return close.sort_index()
+
+
 def build_master_dataset(
     start: str = DATA_START,
     end: str | None = None,
@@ -58,21 +160,16 @@ def build_master_dataset(
         VLO_Hedged_Return, ..., CVI_Hedged_Return
     """
     # ------------------------------------------------------------------
-    # 1. Futures prices — crack spread
+    # 1. Futures prices — M3 crack spread.
+    #    Priority: real M3 (EIA 2015→2024-04 stitched with recent Databento)
+    #    → per-contract hybrid (real Mn where available, continuous elsewhere).
     # ------------------------------------------------------------------
-    futures_tickers = ["CL=F", "RB=F", "HO=F"]
-    fut_raw = yf.download(
-        futures_tickers, start=start, end=end, progress=False, auto_adjust=False
-    )
-    if fut_raw.empty:
-        raise RuntimeError("yfinance returned empty data for futures tickers")
-
-    # yfinance alphabetical order: [CL=F, HO=F, RB=F]
-    fut_close = fut_raw["Close"].copy()
-    fut_close.columns = ["CL", "HO", "RB"]
-    fut_close = fut_close.dropna()
-
-    crack = (2 * fut_close["RB"] * 42 + fut_close["HO"] * 42) / 3 - fut_close["CL"]
+    try:
+        crack = load_real_m3_crack(start=start, end=end)["Crack_Spread"]
+    except (FileNotFoundError, RuntimeError):
+        crack = load_fixed_tenor_crack_with_contracts(
+            start=start, end=end, tenor_prompt=TENOR_PROMPT
+        )["Crack_Spread"]
 
     # H1 FIX: single unified 256-day rolling Z-score on the FULL series
     roll_mean = crack.rolling(Z_SCORE_WINDOW, min_periods=Z_SCORE_WINDOW).mean()
@@ -83,7 +180,7 @@ def build_master_dataset(
     # 2. Equity prices
     # ------------------------------------------------------------------
     equity_symbols = TICKERS + ["SPY"]
-    eq_close = _download_prices(equity_symbols, start=start, end=end)
+    eq_close = _load_equity_close_local_plus_yf(equity_symbols, start=start, end=end)
     eq_returns = eq_close.pct_change()
 
     spy_ret = eq_returns["SPY"]
