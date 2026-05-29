@@ -1,4 +1,32 @@
 """Run 17-fold LoRA walk-forward fine-tuning on Chronos-2."""
+
+'''
+  The training window is a rolling fixed 24 months — it does not grow.
+  Look at the folds:  
+  fold 00: train 2016-03-26 .. 2018-03-26  (24 mo)
+  fold 16: train 2024-03-26 .. 2026-03-26  (24 mo)
+  Each fold trains on exactly 24 months before its test window. So even with 10 years of data, every fold still only trains on its own rolling 2-year
+  slice. Adding history does not make any fold train on more data.
+
+  This is all governed by config:
+  OOS_TEST_START = "2018-04-01"   # where folds begin (fixed)
+  WFO_TRAIN_MONTHS = 24           # rolling train window (fixed size)
+  WFO_TEST_MONTHS  = 6            # test window size → fold count
+'''
+
+
+
+'''
+5 folds (was 17):
+    fold 00: train 2016-12 .. 2021-12 (60mo) | test 2022   ← README split exactly
+    fold 01: train 2017-12 .. 2022-12 (60mo) | test 2023
+    fold 02: train 2018-12 .. 2023-12 (60mo) | test 2024
+    fold 03: train 2019-12 .. 2024-12 (60mo) | test 2025
+    fold 04: train 2020-12 .. 2025-12 (60mo) | test 2026 (partial → 05-26)
+'''
+
+
+
 from __future__ import annotations
 
 import argparse

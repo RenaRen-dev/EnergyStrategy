@@ -21,6 +21,7 @@ Chronos-2 API notes (chronos-forecasting >= 1.4):
 """
 from __future__ import annotations
 
+import os
 import random
 from datetime import timedelta
 from pathlib import Path
@@ -28,6 +29,21 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+
+# Patch torch.optim.AdamW to disable fused on Mac/CPU (not CUDA-compatible).
+# Must run before any trainer/Chronos code tries to create an optimizer with fused=True.
+import torch
+_original_adamw_init = torch.optim.AdamW.__init__
+
+def _patched_adamw_init(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
+                        amsgrad=False, fused=None, **kwargs):
+    if fused is not None and torch.cuda.is_available() is False:
+        # On CPU/Mac, force fused=False; on CUDA, let the caller decide
+        fused = False
+    _original_adamw_init(self, params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
+                         amsgrad=amsgrad, fused=fused, **kwargs)
+
+torch.optim.AdamW.__init__ = _patched_adamw_init
 
 from refiner_strategy.config import (
     CHRONOS_MODEL_ID,

@@ -8,6 +8,21 @@ US oil refiners buy crude and sell gasoline and heating oil. Their profit margin
 
 The thesis is simple: if you can predict the direction of the crack spread one day ahead, you can predict which way refiner stocks will move, because the spread **is** their margin.
 
+1. Load data:
+    - Master dataset (real M3 crack Z-score + stock returns + hedged returns)
+    - Trained Chronos predictions (from walk-forward folds)
+    - DET signal (M6 crack-based, +1/-1, lagged 1 day)
+2. Replay schemes (replay_with_predictions):
+    - Generates trade logs for each scheme (DET, NEW_CAP, ENS_VETO, ENS_AVG)
+    - Each log has: date, ticker, target_size (dollars), actual_ret (beta-hedged daily return)
+    - The signal tells us position direction (+1 long / -1 short)
+3. Simulate long/short (the core logic):
+    - Trades go both long (+1) and short (-1), pure long/short positions (no SPY leg)
+    - Returns used: beta-hedged per-ticker returns ({ticker}_Hedged_Return from master)
+        - This is already market-neutral: stock_return − β × SPY_return
+      - So shorting has an implicit SPY short that cancels the beta exposure
+    - PnL is earned on yesterday's positions (H4 invariant: lagged 1 day)
+
 ## Asset Universe
 
 | Ticker | Name | Weight |
